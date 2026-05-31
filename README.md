@@ -9,7 +9,7 @@ Ayrıca, arka planda çalışan **kendi kendini iyileştirme (Self-Healing)** mi
 ## ✨ Özellikler
 
 * 🔒 **Güvenli ve Şeffaf Sandbox:** `bubblewrap` (`bwrap`) altyapısını kullanarak `/usr`, `/etc` ve `/opt` dizinlerini salt-okunur bağlar. Ancak `/home`, `/dev`, `/tmp` gibi kullanıcı dizinlerini yazma izniyle şeffaf şekilde ana makineye bağlar.
-* 📦 **İzole Paket Kurulumu:** Sistemdeki DNF paket yöneticisini kullanarak bağımlılıkları sadece ilgili izole ortamın (`~/.local/share/izole/envs/<ortam>`) içerisine kurar. Sistem kütüphaneleriniz temiz kalır.
+* 📦 **İzole Paket Kurulumu:** Sistemdeki paket yöneticisini (**DNF**, **APT** veya **Pacman**) otomatik tespit ederek bağımlılıkları sadece ilgili izole ortamın (`~/.local/share/izole/envs/<ortam>`) içerisine kurar. Sistem kütüphaneleriniz temiz kalır.
 * 🎮 **Tam Donanım ve Grafik Desteği:** Ekran sunucuları (X11/Wayland), ses sunucuları (PulseAudio/PipeWire) ve GPU hızlandırma (NVIDIA/AMD) izole uygulamalara şeffaf bir şekilde aktarılır.
 * 🛠 **Özel Binary ve Alias Kayıt:** Dışarıdan indirdiğiniz çalıştırılabilir dosyaları ortama kaydedebilir (`register`) ve terminalde doğrudan ismiyle çalıştırabilmek için shims/takma adlar (`alias`) atayabilirsiniz.
 * ⚙️ **Otomatik NVIDIA Hizalama:** Sistem güncellemeleri sonrası oluşan çekirdek-sürücü sürüm uyuşmazlığını (`version mismatch`) algılar ve ortam içindeki grafik kütüphanelerini otomatik günceller.
@@ -22,7 +22,7 @@ Ayrıca, arka planda çalışan **kendi kendini iyileştirme (Self-Healing)** mi
 ### Gereksinimler
 * Rust ve Cargo (Derlemek için)
 * Bubblewrap (`bwrap`)
-* DNF paket yöneticisi (Fedora/RHEL/CentOS)
+* Sistem Paket Yöneticisi (DNF, APT veya Pacman)
 * Ollama (Yapay zeka desteği için isteğe bağlı)
 
 ### Derleme ve Yükleme
