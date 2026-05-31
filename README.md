@@ -44,7 +44,7 @@ cp target/release/izole ~/.local/bin/
 ## 💻 Kullanım Kılavuzu
 
 ### 1. Ortam Oluşturma ve Paket Kurma (`install`)
-Belirtilen izole ortama RPM paketlerini kurar. Ortam yoksa otomatik oluşturulur.
+Belirtilen izole ortama paketleri (RPM/DEB/Arch PKG) kurar. Ortam yoksa otomatik oluşturulur.
 ```bash
 izole install btop
 ```
