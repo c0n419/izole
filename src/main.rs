@@ -21,7 +21,7 @@ enum Commands {
         /// Ortamın adı
         env_name: String,
     },
-    /// Belirtilen ortama DNF paket(leri) kurar (Ortam yoksa otomatik oluşturulur)
+    /// Belirtilen ortama paket(leri) kurar (Ortam yoksa otomatik oluşturulur)
     Install {
         /// Ortamın adı veya kurulacak tek paket
         env_name: String,
@@ -152,95 +152,76 @@ fn create_env(env_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
-    let env_path = get_env_path(env_name);
-    
-    // Eğer ortam yoksa, kurulum öncesinde otomatik olarak oluştur
-    if !env_path.exists() {
-        println!("Ortam '{}' mevcut değil. Otomatik olarak oluşturuluyor...", env_name);
-        create_env(env_name)?;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Dnf,
+    Apt,
+    Pacman,
+}
 
-    println!("Ortam: {}", env_name);
-    println!("Kurulacak paketler: {:?}", packages);
-
-    // Geçici indirme dizinini oluştur
-    let tmp_downloads = env_path.join("tmp_downloads");
-    if tmp_downloads.exists() {
-        fs::remove_dir_all(&tmp_downloads)?;
-    }
-    fs::create_dir_all(&tmp_downloads)?;
-
-    println!("Paketler indiriliyor (dnf download)...");
-    let mut dnf_cmd = Command::new("dnf");
-    dnf_cmd
-        .arg("download")
-        .arg("-y")
-        .arg("--resolve")
-        .arg(format!("--destdir={}", tmp_downloads.display()));
-
-    for pkg in packages {
-        dnf_cmd.arg(pkg);
-    }
-
-    let status = dnf_cmd.status()?;
-    if !status.success() {
-        eprintln!("Hata: dnf download başarısız oldu.");
-        fs::remove_dir_all(&tmp_downloads)?;
-        std::process::exit(1);
-    }
-
-    // İndirilen RPM'leri bul
-    let mut rpm_files = Vec::new();
-    for entry in fs::read_dir(&tmp_downloads)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "rpm") {
-            rpm_files.push(path);
-        }
-    }
-
-    if rpm_files.is_empty() {
-        println!("Bilgi: İndirilecek yeni paket bulunamadı (Zaten güncel veya kurulu olabilir).");
-        fs::remove_dir_all(&tmp_downloads)?;
-        return Ok(());
-    }
-
-    println!("{} adet RPM paketi arşivden çıkarılıyor...", rpm_files.len());
-    for rpm_path in &rpm_files {
-        println!("Açılıyor: {}", rpm_path.file_name().unwrap().to_string_lossy());
-        extract_rpm(rpm_path, &env_path)?;
-    }
-
-    // Masaüstü kısayollarını tara ve oluştur
-    println!("Masaüstü entegrasyonu kontrol ediliyor...");
-    if let Err(e) = scan_and_generate_desktop_entries(env_name) {
-        eprintln!("Uyarı: Masaüstü kısayolları oluşturulamadı: {}", e);
-    }
-
-    // Metadata'yı güncelle
-    let metadata_path = env_path.join("installed.json");
-    let mut metadata = if metadata_path.exists() {
-        let file = File::open(&metadata_path)?;
-        let reader = BufReader::new(file);
-        serde_json::from_reader(reader).unwrap_or_default()
+fn detect_package_manager() -> PackageManager {
+    if Command::new("dnf").arg("--version").output().is_ok() {
+        PackageManager::Dnf
+    } else if Command::new("apt-get").arg("--version").output().is_ok() {
+        PackageManager::Apt
+    } else if Command::new("pacman").arg("--version").output().is_ok() {
+        PackageManager::Pacman
     } else {
-        EnvMetadata::default()
-    };
+        PackageManager::Dnf
+    }
+}
 
+fn get_apt_dependencies(packages: &[String]) -> Vec<String> {
+    let mut all_pkgs = std::collections::HashSet::new();
     for pkg in packages {
-        if !metadata.packages.contains(pkg) {
-            metadata.packages.push(pkg.clone());
+        all_pkgs.insert(pkg.clone());
+        let output = Command::new("apt-cache")
+            .args(["depends", "--recurse", "--no-recommends", "--no-suggests", "--no-conflicts", "--no-breaks", "--no-replaces", "--no-enhances", pkg])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Depends:") {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let dep = parts[1].trim();
+                        if !dep.starts_with('<') && !dep.ends_with('>') {
+                            all_pkgs.insert(dep.to_string());
+                        }
+                    }
+                } else if trimmed.starts_with("PreDepends:") {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let dep = parts[1].trim();
+                        if !dep.starts_with('<') && !dep.ends_with('>') {
+                            all_pkgs.insert(dep.to_string());
+                        }
+                    }
+                }
+            }
         }
     }
+    all_pkgs.into_iter().collect()
+}
 
-    let file = File::create(metadata_path)?;
-    serde_json::to_writer_pretty(file, &metadata)?;
-
-    // Temizlik
-    fs::remove_dir_all(&tmp_downloads)?;
-    println!("Kurulum tamamlandı!");
-    Ok(())
+fn get_pacman_urls(packages: &[String]) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut cmd = Command::new("pacman");
+    cmd.args(["-Sp", "--noconfirm"]);
+    for pkg in packages {
+        cmd.arg(pkg);
+    }
+    if let Ok(out) = cmd.output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("ftp://") || trimmed.starts_with("file://") {
+                urls.push(trimmed.to_string());
+            }
+        }
+    }
+    urls
 }
 
 fn extract_rpm(rpm_path: &Path, target_dir: &Path) -> io::Result<()> {
@@ -270,6 +251,199 @@ fn extract_rpm(rpm_path: &Path, target_dir: &Path) -> io::Result<()> {
     }
 
     let _ = rpm2cpio.wait()?;
+    Ok(())
+}
+
+fn extract_deb(deb_path: &Path, target_dir: &Path) -> io::Result<()> {
+    let status = Command::new("dpkg")
+        .args(["-x", deb_path.to_str().unwrap(), target_dir.to_str().unwrap()])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "dpkg -x failed"));
+    }
+    Ok(())
+}
+
+fn extract_tar_zst(pkg_path: &Path, target_dir: &Path) -> io::Result<()> {
+    let status = Command::new("tar")
+        .args(["-xf", pkg_path.to_str().unwrap(), "-C", target_dir.to_str().unwrap()])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "tar -xf failed"));
+    }
+    Ok(())
+}
+
+fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
+    let env_path = get_env_path(env_name);
+    
+    if !env_path.exists() {
+        println!("Ortam '{}' mevcut değil. Otomatik olarak oluşturuluyor...", env_name);
+        create_env(env_name)?;
+    }
+
+    println!("Ortam: {}", env_name);
+    println!("Kurulacak paketler: {:?}", packages);
+
+    let tmp_downloads = env_path.join("tmp_downloads");
+    if tmp_downloads.exists() {
+        fs::remove_dir_all(&tmp_downloads)?;
+    }
+    fs::create_dir_all(&tmp_downloads)?;
+
+    let pm = detect_package_manager();
+    match pm {
+        PackageManager::Dnf => {
+            println!("Paketler indiriliyor (dnf download)...");
+            let mut dnf_cmd = Command::new("dnf");
+            dnf_cmd
+                .arg("download")
+                .arg("-y")
+                .arg("--resolve")
+                .arg(format!("--destdir={}", tmp_downloads.display()));
+
+            for pkg in packages {
+                dnf_cmd.arg(pkg);
+            }
+
+            let status = dnf_cmd.status()?;
+            if !status.success() {
+                eprintln!("Hata: dnf download başarısız oldu.");
+                fs::remove_dir_all(&tmp_downloads)?;
+                std::process::exit(1);
+            }
+
+            let mut rpm_files = Vec::new();
+            for entry in fs::read_dir(&tmp_downloads)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "rpm") {
+                    rpm_files.push(path);
+                }
+            }
+
+            if rpm_files.is_empty() {
+                println!("Bilgi: İndirilecek yeni paket bulunamadı (Zaten güncel veya kurulu olabilir).");
+                fs::remove_dir_all(&tmp_downloads)?;
+                return Ok(());
+            }
+
+            println!("{} adet RPM paketi arşivden çıkarılıyor...", rpm_files.len());
+            for rpm_path in &rpm_files {
+                println!("Açılıyor: {}", rpm_path.file_name().unwrap().to_string_lossy());
+                extract_rpm(rpm_path, &env_path)?;
+            }
+        }
+        PackageManager::Apt => {
+            println!("Bağımlılıklar sorgulanıyor (apt-cache)...");
+            let all_packages = get_apt_dependencies(packages);
+            println!("Paketler ve bağımlılıkları indiriliyor (apt-get download)...");
+            
+            let status = Command::new("apt-get")
+                .arg("download")
+                .args(&all_packages)
+                .current_dir(&tmp_downloads)
+                .status()?;
+
+            if !status.success() {
+                eprintln!("Hata: apt-get download başarısız oldu.");
+                fs::remove_dir_all(&tmp_downloads)?;
+                std::process::exit(1);
+            }
+
+            let mut deb_files = Vec::new();
+            for entry in fs::read_dir(&tmp_downloads)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "deb") {
+                    deb_files.push(path);
+                }
+            }
+
+            if deb_files.is_empty() {
+                println!("Bilgi: İndirilecek yeni paket bulunamadı.");
+                fs::remove_dir_all(&tmp_downloads)?;
+                return Ok(());
+            }
+
+            println!("{} adet DEB paketi arşivden çıkarılıyor...", deb_files.len());
+            for deb_path in &deb_files {
+                println!("Açılıyor: {}", deb_path.file_name().unwrap().to_string_lossy());
+                extract_deb(deb_path, &env_path)?;
+            }
+        }
+        PackageManager::Pacman => {
+            println!("Paket indirme URL'leri sorgulanıyor (pacman -Sp)...");
+            let urls = get_pacman_urls(packages);
+            if urls.is_empty() {
+                eprintln!("Hata: pacman indirme URL'leri alınamadı.");
+                fs::remove_dir_all(&tmp_downloads)?;
+                std::process::exit(1);
+            }
+
+            println!("Paketler indiriliyor (curl)...");
+            for url in &urls {
+                println!("İndiriliyor: {}", url);
+                let status = Command::new("curl")
+                    .args(["-sSL", "-O", url])
+                    .current_dir(&tmp_downloads)
+                    .status()?;
+                if !status.success() {
+                    eprintln!("Hata: '{}' indirilemedi.", url);
+                    fs::remove_dir_all(&tmp_downloads)?;
+                    std::process::exit(1);
+                }
+            }
+
+            let mut pkg_files = Vec::new();
+            for entry in fs::read_dir(&tmp_downloads)? {
+                let entry = entry?;
+                let path = entry.path();
+                let filename = path.file_name().unwrap().to_string_lossy();
+                if filename.contains(".pkg.tar.") {
+                    pkg_files.push(path);
+                }
+            }
+
+            if pkg_files.is_empty() {
+                println!("Bilgi: İndirilecek yeni paket bulunamadı.");
+                fs::remove_dir_all(&tmp_downloads)?;
+                return Ok(());
+            }
+
+            println!("{} adet Arch paketi arşivden çıkarılıyor...", pkg_files.len());
+            for pkg_path in &pkg_files {
+                println!("Açılıyor: {}", pkg_path.file_name().unwrap().to_string_lossy());
+                extract_tar_zst(pkg_path, &env_path)?;
+            }
+        }
+    }
+
+    println!("Masaüstü entegrasyonu kontrol ediliyor...");
+    if let Err(e) = scan_and_generate_desktop_entries(env_name) {
+        eprintln!("Uyarı: Masaüstü kısayolları oluşturulamadı: {}", e);
+    }
+
+    let metadata_path = env_path.join("installed.json");
+    let mut metadata = if metadata_path.exists() {
+        let file = File::open(&metadata_path)?;
+        let reader = BufReader::new(file);
+        serde_json::from_reader(reader).unwrap_or_default()
+    } else {
+        EnvMetadata::default()
+    };
+
+    for pkg in packages {
+        if !metadata.packages.contains(pkg) {
+            metadata.packages.push(pkg.clone());
+        }
+    }
+
+    let file = File::create(metadata_path)?;
+    serde_json::to_writer_pretty(file, &metadata)?;
+
+    fs::remove_dir_all(&tmp_downloads)?;
+    println!("Kurulum tamamlandı!");
     Ok(())
 }
 
@@ -432,7 +606,12 @@ fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
                     return Ok(exit_code);
                 }
 
-                println!("\x1b[1;34m[İzole Self-Healing] DNF üzerinden '{}' kütüphanesini sağlayan paket aranıyor...\x1b[0m", lib_name);
+                let pm_name = match detect_package_manager() {
+                    PackageManager::Dnf => "DNF",
+                    PackageManager::Apt => "APT",
+                    PackageManager::Pacman => "Pacman",
+                };
+                println!("\x1b[1;34m[İzole Self-Healing] {} üzerinden '{}' kütüphanesini sağlayan paket aranıyor...\x1b[0m", pm_name, lib_name);
                 let is_steam = command.contains("steam") || args.iter().any(|arg| arg.contains("steam"));
                 if let Some(pkg_name) = find_package_for_library(&lib_name, is_steam) {
                     println!("\x1b[1;32m[İzole Self-Healing] Paket bulundu: '{}'. Otomatik olarak kuruluyor...\x1b[0m", pkg_name);
@@ -796,7 +975,7 @@ fn info_env(env_name: &str) -> io::Result<()> {
     } else {
         packages.join(", ")
     };
-    println!("Kurulu DNF Paketleri: {}", pkgs_str);
+    println!("Kurulu Paketler: {}", pkgs_str);
 
     let app_dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("/home/ninja/.local/share"))
@@ -964,7 +1143,7 @@ fn interactive_menu() -> io::Result<()> {
         let options = &[
             "📂 Ortamları Listele",
             "✨ Yeni Ortam Oluştur",
-            "📥 DNF Paketi Kur",
+            "📥 Paket Kur",
             "⚡ Uygulama Çalıştır (Run)",
             "🐚 İnteraktif Kabuk Başlat (Enter)",
             "📊 Ortam Bilgisi Görüntüle (Info)",
@@ -1415,43 +1594,99 @@ fn parse_missing_library(stderr: &str) -> Option<String> {
 }
 
 fn find_package_for_library(lib_name: &str, is_steam: bool) -> Option<String> {
-    let output = Command::new("dnf")
-        .args(["provides", &format!("*/{}", lib_name)])
-        .output()
-        .ok()?;
+    let pm = detect_package_manager();
+    match pm {
+        PackageManager::Dnf => {
+            let output = Command::new("dnf")
+                .args(["provides", &format!("*/{}", lib_name)])
+                .output()
+                .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut packages = Vec::new();
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains(" : ") && !trimmed.starts_with("Repo") && !trimmed.starts_with("Matched") && !trimmed.starts_with("Provide") && !trimmed.starts_with("Filename") {
-            if let Some(pkg) = trimmed.split_whitespace().next() {
-                packages.push(pkg.to_string());
+            if !output.status.success() {
+                return None;
             }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut packages = Vec::new();
+
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains(" : ") && !trimmed.starts_with("Repo") && !trimmed.starts_with("Matched") && !trimmed.starts_with("Provide") && !trimmed.starts_with("Filename") {
+                    if let Some(pkg) = trimmed.split_whitespace().next() {
+                        packages.push(pkg.to_string());
+                    }
+                }
+            }
+
+            if packages.is_empty() {
+                return None;
+            }
+
+            if is_steam || lib_name.contains("i686") || lib_name.contains("32") {
+                if let Some(pkg) = packages.iter().find(|pkg| pkg.contains(".i686")) {
+                    return Some(pkg.clone());
+                }
+            } else {
+                if let Some(pkg) = packages.iter().find(|pkg| pkg.contains(".x86_64")) {
+                    return Some(pkg.clone());
+                }
+            }
+
+            Some(packages[0].clone())
+        }
+        PackageManager::Apt => {
+            let output = Command::new("apt-file")
+                .args(["search", lib_name])
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    for line in stdout.lines() {
+                        if let Some(colon_idx) = line.find(':') {
+                            let pkg = line[..colon_idx].trim().to_string();
+                            if is_steam || lib_name.contains("i386") || lib_name.contains("32") {
+                                if pkg.contains(":i386") {
+                                    return Some(pkg);
+                                }
+                            } else {
+                                if !pkg.contains(":i386") {
+                                    return Some(pkg);
+                                }
+                            }
+                            return Some(pkg);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        PackageManager::Pacman => {
+            let output = Command::new("pacman")
+                .args(["-F", lib_name])
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    for line in stdout.lines() {
+                        if line.contains(" is owned by ") {
+                            let parts: Vec<&str> = line.split(" is owned by ").collect();
+                            if parts.len() >= 2 {
+                                let pkg_info = parts[1].trim();
+                                if let Some(pkg_name) = pkg_info.split_whitespace().next() {
+                                    if let Some(slash_idx) = pkg_name.find('/') {
+                                        return Some(pkg_name[slash_idx+1..].to_string());
+                                    } else {
+                                        return Some(pkg_name.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
         }
     }
-
-    if packages.is_empty() {
-        return None;
-    }
-
-    // Filter by architecture
-    if is_steam || lib_name.contains("i686") || lib_name.contains("32") {
-        if let Some(pkg) = packages.iter().find(|pkg| pkg.contains(".i686")) {
-            return Some(pkg.clone());
-        }
-    } else {
-        if let Some(pkg) = packages.iter().find(|pkg| pkg.contains(".x86_64")) {
-            return Some(pkg.clone());
-        }
-    }
-
-    Some(packages[0].clone())
 }
 
 fn align_nvidia_drivers_if_needed(env_name: &str) -> io::Result<()> {
@@ -1531,6 +1766,17 @@ fn run_ollama_diagnosis(command: &str, stderr: &str) -> Option<AiDiagnosis> {
     }
 
     let model = get_first_ollama_model().unwrap_or_else(|| "llama3".to_string());
+    let pm = detect_package_manager();
+    let pm_desc = match pm {
+        PackageManager::Dnf => "DNF paket adı",
+        PackageManager::Apt => "APT (deb) paket adı",
+        PackageManager::Pacman => "pacman paket adı",
+    };
+    let pm_cmd_example = match pm {
+        PackageManager::Dnf => "sudo dnf install ...",
+        PackageManager::Apt => "sudo apt-get install ...",
+        PackageManager::Pacman => "sudo pacman -S ...",
+    };
 
     let prompt = format!(
         "Sen bir Linux ve Bubblewrap sandbox uzmanı yapay zeka asistanısın. \
@@ -1541,10 +1787,10 @@ fn run_ollama_diagnosis(command: &str, stderr: &str) -> Option<AiDiagnosis> {
         {{\n\
           \"explanation\": \"Hatanın kısa Türkçe açıklaması (maksimum 2 cümle).\",\n\
           \"fix_action\": \"install_container_package\" veya \"run_command\" veya \"none\",\n\
-          \"package_name\": \"Eğer kurulması gereken bir DNF paket adı varsa yaz, yoksa null\",\n\
-          \"command_to_run\": \"Eğer çalıştırılması gereken bir komut varsa (örn: sudo dnf install ... veya mkdir ...), yoksa null\"\n\
+          \"package_name\": \"Eğer kurulması gereken bir {} varsa yaz, yoksa null\",\n\
+          \"command_to_run\": \"Eğer çalıştırılması gereken bir komut varsa (örn: {} veya mkdir ...), yoksa null\"\n\
         }}",
-        command, stderr
+        command, stderr, pm_desc, pm_cmd_example
     );
     
     let payload = serde_json::json!({
