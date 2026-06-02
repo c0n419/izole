@@ -100,13 +100,13 @@ fn main() -> io::Result<()> {
         Some(cmd) => match cmd {
             Commands::Create { env_name } => create_env(&env_name),
             Commands::Install { env_name, packages } => {
-                // Eğer packages boşsa, env_name'i hem ortam adı hem de kurulacak paket adı olarak kullanırız.
-                let target_packages = if packages.is_empty() {
-                    vec![env_name.clone()]
+                let (resolved_env_name, target_packages) = if packages.is_empty() {
+                    let extracted = extract_env_name(&env_name);
+                    (extracted, vec![env_name.clone()])
                 } else {
-                    packages
+                    (env_name, packages)
                 };
-                install_packages(&env_name, &target_packages)
+                install_packages(&resolved_env_name, &target_packages)
             }
             Commands::Run { env_name, command, args } => {
                 let code = run_env(&env_name, &command, &args)?;
@@ -274,6 +274,162 @@ fn extract_tar_zst(pkg_path: &Path, target_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn extract_env_name(source: &str) -> String {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let mut clean = source.trim_end_matches(".git").to_string();
+        while clean.ends_with('/') {
+            clean.pop();
+        }
+        if let Some(last_slash) = clean.rfind('/') {
+            let name = &clean[last_slash + 1..];
+            return name.to_lowercase();
+        }
+    }
+    let path = Path::new(source);
+    if path.exists() && path.is_file() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let mut name = stem.to_lowercase();
+            if let Some(dash_idx) = name.find('-') {
+                name = name[..dash_idx].to_string();
+            }
+            return name;
+        }
+    }
+    source.to_string()
+}
+
+fn handle_custom_install(_env_name: &str, pkg_source: &str, tmp_downloads: &Path) -> io::Result<bool> {
+    let pm = detect_package_manager();
+    
+    if pkg_source.starts_with("http://") || pkg_source.starts_with("https://") {
+        if pkg_source.contains("github.com") {
+            let mut clean_url = pkg_source.trim_end_matches(".git").to_string();
+            while clean_url.ends_with('/') {
+                clean_url.pop();
+            }
+            
+            let parts: Vec<&str> = clean_url.split("github.com/").collect();
+            if parts.len() >= 2 {
+                let repo_path = parts[1];
+                let path_parts: Vec<&str> = repo_path.split('/').collect();
+                if path_parts.len() >= 2 {
+                    let owner = path_parts[0];
+                    let repo = path_parts[1];
+                    println!("[İzole] GitHub API üzerinden en son sürüm sorgulanıyor: {}/{}...", owner, repo);
+                    
+                    let api_url = format!("https://api.github.com/repos/{}/{}/releases/latest", owner, repo);
+                    let output = Command::new("curl")
+                        .args(["-sSL", "-H", "User-Agent: izole", &api_url])
+                        .output();
+                        
+                    if let Ok(out) = output {
+                        if out.status.success() {
+                            let json_str = String::from_utf8_lossy(&out.stdout);
+                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                if let Some(assets) = json_val.get("assets").and_then(|a| a.as_array()) {
+                                    let extension = match pm {
+                                        PackageManager::Dnf => ".rpm",
+                                        PackageManager::Apt => ".deb",
+                                        PackageManager::Pacman => ".pkg.tar.",
+                                    };
+                                    
+                                    let host_arch = std::env::consts::ARCH;
+                                    let mut found_asset = None;
+                                    let mut best_score = -100;
+                                    
+                                    for asset in assets {
+                                        if let Some(name) = asset.get("name").and_then(|n| n.as_str()) {
+                                            let name_lower = name.to_lowercase();
+                                            if name_lower.contains(extension) {
+                                                let mut score = 0;
+                                                if host_arch == "x86_64" {
+                                                    if name_lower.contains("x86_64") || name_lower.contains("amd64") || name_lower.contains("x64") {
+                                                        score += 10;
+                                                    }
+                                                    if name_lower.contains("i386") || name_lower.contains("i686") || name_lower.contains("386") || name_lower.contains("arm") || name_lower.contains("aarch64") {
+                                                        score -= 20;
+                                                    }
+                                                } else if host_arch == "aarch64" || host_arch == "arm64" {
+                                                    if name_lower.contains("aarch64") || name_lower.contains("arm64") {
+                                                        score += 10;
+                                                    }
+                                                    if name_lower.contains("x86_64") || name_lower.contains("amd64") || name_lower.contains("i386") {
+                                                        score -= 20;
+                                                    }
+                                                }
+                                                
+                                                if score > best_score {
+                                                    best_score = score;
+                                                    found_asset = Some(asset.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    if let Some(asset) = found_asset {
+                                        let asset_name = asset.get("name").and_then(|n| n.as_str()).unwrap();
+                                        let download_url = asset.get("browser_download_url").and_then(|u| u.as_str()).unwrap();
+                                        println!("[İzole] Uyumlu paket bulundu: {}...", asset_name);
+                                        println!("[İzole] İndiriliyor: {}...", download_url);
+                                        
+                                        let status = Command::new("curl")
+                                            .args(["-sSL", "-O", download_url])
+                                            .current_dir(tmp_downloads)
+                                            .status()?;
+                                            
+                                        if status.success() {
+                                            println!("[İzole] İndirme tamamlandı: {}", asset_name);
+                                            return Ok(true);
+                                        } else {
+                                            return Err(io::Error::new(io::ErrorKind::Other, "GitHub release asset download failed"));
+                                        }
+                                    } else {
+                                        println!("Uyarı: Bu GitHub sürümünde işletim sisteminizle uyumlu bir paket ({} uzantılı) bulunamadı.", extension);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        let extension = if pkg_source.contains(".rpm") {
+            Some("rpm")
+        } else if pkg_source.contains(".deb") {
+            Some("deb")
+        } else if pkg_source.contains(".pkg.tar.") || pkg_source.contains(".tar.zst") || pkg_source.contains(".tar.xz") {
+            Some("pkg")
+        } else {
+            None
+        };
+        
+        if let Some(_ext) = extension {
+            println!("[İzole] Doğrudan URL üzerinden indiriliyor: {}...", pkg_source);
+            let status = Command::new("curl")
+                .args(["-sSL", "-O", pkg_source])
+                .current_dir(tmp_downloads)
+                .status()?;
+            if status.success() {
+                return Ok(true);
+            }
+        }
+    }
+    
+    let path = Path::new(pkg_source);
+    if path.exists() && path.is_file() {
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if extension == "rpm" || extension == "deb" || extension == "zst" || extension == "xz" || pkg_source.contains(".pkg.tar.") {
+            println!("[İzole] Yerel dosya kopyalanıyor: {}...", pkg_source);
+            let dest_file = tmp_downloads.join(path.file_name().unwrap());
+            fs::copy(path, dest_file)?;
+            return Ok(true);
+        }
+    }
+    
+    Ok(false)
+}
+
 fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
     let env_path = get_env_path(env_name);
     
@@ -283,7 +439,7 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
     }
 
     println!("Ortam: {}", env_name);
-    println!("Kurulacak paketler: {:?}", packages);
+    println!("Kurulacak paketler/kaynaklar: {:?}", packages);
 
     let tmp_downloads = env_path.join("tmp_downloads");
     if tmp_downloads.exists() {
@@ -291,132 +447,116 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
     }
     fs::create_dir_all(&tmp_downloads)?;
 
-    let pm = detect_package_manager();
-    match pm {
-        PackageManager::Dnf => {
-            println!("Paketler indiriliyor (dnf download)...");
-            let mut dnf_cmd = Command::new("dnf");
-            dnf_cmd
-                .arg("download")
-                .arg("-y")
-                .arg("--resolve")
-                .arg(format!("--destdir={}", tmp_downloads.display()));
+    let mut system_packages = Vec::new();
+    let mut custom_installed_count = 0;
 
-            for pkg in packages {
-                dnf_cmd.arg(pkg);
+    for pkg in packages {
+        match handle_custom_install(env_name, pkg, &tmp_downloads) {
+            Ok(true) => {
+                custom_installed_count += 1;
             }
-
-            let status = dnf_cmd.status()?;
-            if !status.success() {
-                eprintln!("Hata: dnf download başarısız oldu.");
-                fs::remove_dir_all(&tmp_downloads)?;
-                std::process::exit(1);
+            Ok(false) => {
+                system_packages.push(pkg.clone());
             }
-
-            let mut rpm_files = Vec::new();
-            for entry in fs::read_dir(&tmp_downloads)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "rpm") {
-                    rpm_files.push(path);
-                }
-            }
-
-            if rpm_files.is_empty() {
-                println!("Bilgi: İndirilecek yeni paket bulunamadı (Zaten güncel veya kurulu olabilir).");
-                fs::remove_dir_all(&tmp_downloads)?;
-                return Ok(());
-            }
-
-            println!("{} adet RPM paketi arşivden çıkarılıyor...", rpm_files.len());
-            for rpm_path in &rpm_files {
-                println!("Açılıyor: {}", rpm_path.file_name().unwrap().to_string_lossy());
-                extract_rpm(rpm_path, &env_path)?;
+            Err(e) => {
+                eprintln!("Uyarı: Özel kaynak yüklenirken hata oluştu ({pkg}): {e}");
             }
         }
-        PackageManager::Apt => {
-            println!("Bağımlılıklar sorgulanıyor (apt-cache)...");
-            let all_packages = get_apt_dependencies(packages);
-            println!("Paketler ve bağımlılıkları indiriliyor (apt-get download)...");
-            
-            let status = Command::new("apt-get")
-                .arg("download")
-                .args(&all_packages)
-                .current_dir(&tmp_downloads)
-                .status()?;
+    }
 
-            if !status.success() {
-                eprintln!("Hata: apt-get download başarısız oldu.");
-                fs::remove_dir_all(&tmp_downloads)?;
-                std::process::exit(1);
-            }
+    if !system_packages.is_empty() {
+        let pm = detect_package_manager();
+        match pm {
+            PackageManager::Dnf => {
+                println!("Paketler indiriliyor (dnf download)...");
+                let mut dnf_cmd = Command::new("dnf");
+                dnf_cmd
+                    .arg("download")
+                    .arg("-y")
+                    .arg("--resolve")
+                    .arg(format!("--destdir={}", tmp_downloads.display()));
 
-            let mut deb_files = Vec::new();
-            for entry in fs::read_dir(&tmp_downloads)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "deb") {
-                    deb_files.push(path);
+                for pkg in &system_packages {
+                    dnf_cmd.arg(pkg);
                 }
-            }
 
-            if deb_files.is_empty() {
-                println!("Bilgi: İndirilecek yeni paket bulunamadı.");
-                fs::remove_dir_all(&tmp_downloads)?;
-                return Ok(());
-            }
-
-            println!("{} adet DEB paketi arşivden çıkarılıyor...", deb_files.len());
-            for deb_path in &deb_files {
-                println!("Açılıyor: {}", deb_path.file_name().unwrap().to_string_lossy());
-                extract_deb(deb_path, &env_path)?;
-            }
-        }
-        PackageManager::Pacman => {
-            println!("Paket indirme URL'leri sorgulanıyor (pacman -Sp)...");
-            let urls = get_pacman_urls(packages);
-            if urls.is_empty() {
-                eprintln!("Hata: pacman indirme URL'leri alınamadı.");
-                fs::remove_dir_all(&tmp_downloads)?;
-                std::process::exit(1);
-            }
-
-            println!("Paketler indiriliyor (curl)...");
-            for url in &urls {
-                println!("İndiriliyor: {}", url);
-                let status = Command::new("curl")
-                    .args(["-sSL", "-O", url])
-                    .current_dir(&tmp_downloads)
-                    .status()?;
+                let status = dnf_cmd.status()?;
                 if !status.success() {
-                    eprintln!("Hata: '{}' indirilemedi.", url);
+                    eprintln!("Hata: dnf download başarısız oldu.");
                     fs::remove_dir_all(&tmp_downloads)?;
                     std::process::exit(1);
                 }
             }
+            PackageManager::Apt => {
+                println!("Bağımlılıklar sorgulanıyor (apt-cache)...");
+                let all_packages = get_apt_dependencies(&system_packages);
+                println!("Paketler ve bağımlılıkları indiriliyor (apt-get download)...");
+                
+                let status = Command::new("apt-get")
+                    .arg("download")
+                    .args(&all_packages)
+                    .current_dir(&tmp_downloads)
+                    .status()?;
 
-            let mut pkg_files = Vec::new();
-            for entry in fs::read_dir(&tmp_downloads)? {
-                let entry = entry?;
-                let path = entry.path();
-                let filename = path.file_name().unwrap().to_string_lossy();
-                if filename.contains(".pkg.tar.") {
-                    pkg_files.push(path);
+                if !status.success() {
+                    eprintln!("Hata: apt-get download başarısız oldu.");
+                    fs::remove_dir_all(&tmp_downloads)?;
+                    std::process::exit(1);
                 }
             }
+            PackageManager::Pacman => {
+                println!("Paket indirme URL'leri sorgulanıyor (pacman -Sp)...");
+                let urls = get_pacman_urls(&system_packages);
+                if urls.is_empty() {
+                    eprintln!("Hata: pacman indirme URL'leri alınamadı.");
+                    fs::remove_dir_all(&tmp_downloads)?;
+                    std::process::exit(1);
+                }
 
-            if pkg_files.is_empty() {
-                println!("Bilgi: İndirilecek yeni paket bulunamadı.");
-                fs::remove_dir_all(&tmp_downloads)?;
-                return Ok(());
-            }
-
-            println!("{} adet Arch paketi arşivden çıkarılıyor...", pkg_files.len());
-            for pkg_path in &pkg_files {
-                println!("Açılıyor: {}", pkg_path.file_name().unwrap().to_string_lossy());
-                extract_tar_zst(pkg_path, &env_path)?;
+                println!("Paketler indiriliyor (curl)...");
+                for url in &urls {
+                    println!("İndiriliyor: {}", url);
+                    let status = Command::new("curl")
+                        .args(["-sSL", "-O", url])
+                        .current_dir(&tmp_downloads)
+                        .status()?;
+                    if !status.success() {
+                        eprintln!("Hata: '{}' indirilemedi.", url);
+                        fs::remove_dir_all(&tmp_downloads)?;
+                        std::process::exit(1);
+                    }
+                }
             }
         }
+    }
+
+    println!("Paketler arşivden çıkarılıyor...");
+    let mut extracted_any = false;
+    for entry in fs::read_dir(&tmp_downloads)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let filename = path.file_name().unwrap().to_string_lossy().to_lowercase();
+            if filename.ends_with(".rpm") {
+                println!("Açılıyor (RPM): {}", path.file_name().unwrap().to_string_lossy());
+                extract_rpm(&path, &env_path)?;
+                extracted_any = true;
+            } else if filename.ends_with(".deb") {
+                println!("Açılıyor (DEB): {}", path.file_name().unwrap().to_string_lossy());
+                extract_deb(&path, &env_path)?;
+                extracted_any = true;
+            } else if filename.contains(".pkg.tar.") || filename.ends_with(".tar.zst") || filename.ends_with(".tar.xz") || filename.ends_with(".tar.gz") {
+                println!("Açılıyor (Arch/Tarball): {}", path.file_name().unwrap().to_string_lossy());
+                extract_tar_zst(&path, &env_path)?;
+                extracted_any = true;
+            }
+        }
+    }
+
+    if !extracted_any && custom_installed_count == 0 {
+        println!("Bilgi: İndirilecek veya kurulacak yeni paket bulunamadı.");
+        fs::remove_dir_all(&tmp_downloads)?;
+        return Ok(());
     }
 
     println!("Masaüstü entegrasyonu kontrol ediliyor...");
@@ -441,6 +581,46 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
 
     let file = File::create(metadata_path)?;
     serde_json::to_writer_pretty(file, &metadata)?;
+
+    // Otomatik takma ad (alias) oluşturma kontrolü
+    let bin_dir = env_path.join("usr/bin");
+    if bin_dir.exists() && bin_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&bin_dir) {
+            let mut execs = Vec::new();
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_file() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            if let Ok(meta) = path.metadata() {
+                                if meta.mode() & 0o111 != 0 {
+                                    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                                        execs.push(filename.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !execs.is_empty() {
+                let mut target_bin = None;
+                if execs.contains(&env_name.to_string()) {
+                    target_bin = Some(env_name.to_string());
+                } else if execs.len() == 1 {
+                    target_bin = Some(execs[0].clone());
+                }
+
+                if let Some(bin_name) = target_bin {
+                    println!("\n[İzole] Otomatik terminal takma adı (alias) oluşturuluyor: {}...", env_name);
+                    let _ = alias_binary(env_name, &bin_name, Some(env_name));
+                }
+            }
+        }
+    }
 
     fs::remove_dir_all(&tmp_downloads)?;
     println!("Kurulum tamamlandı!");
