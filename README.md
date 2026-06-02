@@ -44,7 +44,7 @@ cp target/release/izole ~/.local/bin/
 ## 💻 Kullanım Kılavuzu
 
 ### 1. Ortam Oluşturma ve Paket Kurma (`install`)
-Belirtilen ortama standart sistem paketlerini, yerel dosya yollarını, doğrudan indirme linklerini veya doğrudan **GitHub depo URL'lerini** kurar. Ortam yoksa otomatik oluşturulur.
+Belirtilen ortama standart sistem paketlerini, yerel dosya yollarını, doğrudan indirme linklerini, doğrudan **GitHub depo URL'lerini** veya **farklı bir dağıtımın (Arch Linux) resmi depolarını** kurar. Ortam yoksa otomatik oluşturulur.
 
 ```bash
 # Standart sistem paketini kurma
@@ -58,6 +58,9 @@ izole install heroic https://example.com/Heroic-2.14.1.x86_64.rpm
 
 # Doğrudan GitHub reposunu (Releases sayfasındaki en güncel uyumlu paketi) kurma:
 izole install https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher.git
+
+# FARKLI DAĞITIM DESTEĞİ: Arch Linux depolarından btop paketini Fedora'ya indirip kurma
+izole install arch-btop arch:btop
 ```
 > [!TIP]
 > Bir paketi veya GitHub reposunu doğrudan kurduğunuzda, sistem paketin içindeki binary'leri otomatik tarar ve **terminal takma adını (alias/kısayol) otomatik oluşturur**. Örneğin Heroic kurulumundan sonra doğrudan terminale `heroicgameslauncher` yazarak uygulamayı başlatabilirsiniz. Masaüstü kısayolları da otomatik oluşturulur.
