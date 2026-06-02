@@ -298,7 +298,74 @@ fn extract_env_name(source: &str) -> String {
     source.to_string()
 }
 
+fn handle_arch_package_install(pkg_name: &str, tmp_downloads: &Path) -> io::Result<bool> {
+    let host_arch = std::env::consts::ARCH;
+    let arch_name = match host_arch {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => "x86_64",
+    };
+    
+    println!("[İzole] Arch Linux depolarında paket aranıyor: {} ({})...", pkg_name, arch_name);
+    
+    let search_url = format!("https://archlinux.org/packages/search/json/?name={}", pkg_name);
+    let output = Command::new("curl")
+        .args(["-sSL", "-H", "User-Agent: izole", &search_url])
+        .output();
+        
+    if let Ok(out) = output {
+        if out.status.success() {
+            let json_str = String::from_utf8_lossy(&out.stdout);
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(results) = json_val.get("results").and_then(|r| r.as_array()) {
+                    let mut found_pkg = None;
+                    for res in results {
+                        if let (Some(name), Some(arch), Some(repo)) = (
+                            res.get("pkgname").and_then(|n| n.as_str()),
+                            res.get("arch").and_then(|a| a.as_str()),
+                            res.get("repo").and_then(|r| r.as_str()),
+                        ) {
+                            if name == pkg_name && arch == arch_name {
+                                found_pkg = Some((name.to_string(), arch.to_string(), repo.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if let Some((name, arch, repo)) = found_pkg {
+                        let download_url = format!("https://archlinux.org/packages/{}/{}/{}/download/", repo, arch, name);
+                        println!("[İzole] Arch paketi bulundu. İndiriliyor: {}...", download_url);
+                        
+                        let dest_filename = format!("{}.pkg.tar.zst", name);
+                        let dest_path = tmp_downloads.join(&dest_filename);
+                        
+                        let status = Command::new("curl")
+                            .args(["-sSL", "-o", dest_path.to_str().unwrap(), &download_url])
+                            .status()?;
+                            
+                        if status.success() {
+                            println!("[İzole] Arch paketi indirme tamamlandı: {}", dest_filename);
+                            return Ok(true);
+                        } else {
+                            return Err(io::Error::new(io::ErrorKind::Other, "Arch package download failed"));
+                        }
+                    } else {
+                        println!("Hata: Arch depolarında '{}' adında ve '{}' mimarisinde paket bulunamadı.", pkg_name, arch_name);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
 fn handle_custom_install(_env_name: &str, pkg_source: &str, tmp_downloads: &Path) -> io::Result<bool> {
+    if pkg_source.starts_with("arch:") {
+        let real_pkg_name = &pkg_source[5..];
+        return handle_arch_package_install(real_pkg_name, tmp_downloads);
+    }
+
     let pm = detect_package_manager();
     
     if pkg_source.starts_with("http://") || pkg_source.starts_with("https://") {
