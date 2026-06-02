@@ -44,11 +44,23 @@ cp target/release/izole ~/.local/bin/
 ## 💻 Kullanım Kılavuzu
 
 ### 1. Ortam Oluşturma ve Paket Kurma (`install`)
-Belirtilen izole ortama paketleri (RPM/DEB/Arch PKG) kurar. Ortam yoksa otomatik oluşturulur.
+Belirtilen ortama standart sistem paketlerini, yerel dosya yollarını, doğrudan indirme linklerini veya doğrudan **GitHub depo URL'lerini** kurar. Ortam yoksa otomatik oluşturulur.
+
 ```bash
+# Standart sistem paketini kurma
 izole install btop
+
+# Yerel paketi (.rpm, .deb, .tar.zst) kurma
+izole install heroic ~/Downloads/Heroic-2.14.1.x86_64.rpm
+
+# Doğrudan URL üzerinden indirme ve kurma
+izole install heroic https://example.com/Heroic-2.14.1.x86_64.rpm
+
+# Doğrudan GitHub reposunu (Releases sayfasındaki en güncel uyumlu paketi) kurma:
+izole install https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher.git
 ```
-*Masaüstü kısayolları (`.desktop` dosyaları) otomatik olarak `~/.local/share/applications` altına aktarılır ve uygulama menünüze eklenir.*
+> [!TIP]
+> Bir paketi veya GitHub reposunu doğrudan kurduğunuzda, sistem paketin içindeki binary'leri otomatik tarar ve **terminal takma adını (alias/kısayol) otomatik oluşturur**. Örneğin Heroic kurulumundan sonra doğrudan terminale `heroicgameslauncher` yazarak uygulamayı başlatabilirsiniz. Masaüstü kısayolları da otomatik oluşturulur.
 
 ### 2. Uygulama Çalıştırma (`run`)
 ```bash
