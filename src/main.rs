@@ -345,7 +345,7 @@ fn handle_arch_package_install(pkg_name: &str, tmp_downloads: &Path) -> io::Resu
                         let dest_path = tmp_downloads.join(&dest_filename);
                         
                         let status = Command::new("curl")
-                            .args(["-sSL", "-o", dest_path.to_str().unwrap(), &download_url])
+                            .args(["-sSLf", "-o", dest_path.to_str().unwrap(), &download_url])
                             .status()?;
                             
                         if status.success() {
@@ -445,7 +445,7 @@ fn handle_custom_install(_env_name: &str, pkg_source: &str, tmp_downloads: &Path
                                         println!("[İzole] İndiriliyor: {}...", download_url);
                                         
                                         let status = Command::new("curl")
-                                            .args(["-sSL", "-O", download_url])
+                                            .args(["-sSLf", "-O", download_url])
                                             .current_dir(tmp_downloads)
                                             .status()?;
                                             
@@ -479,11 +479,13 @@ fn handle_custom_install(_env_name: &str, pkg_source: &str, tmp_downloads: &Path
         if let Some(_ext) = extension {
             println!("[İzole] Doğrudan URL üzerinden indiriliyor: {}...", pkg_source);
             let status = Command::new("curl")
-                .args(["-sSL", "-O", pkg_source])
+                .args(["-sSLf", "-O", pkg_source])
                 .current_dir(tmp_downloads)
                 .status()?;
             if status.success() {
                 return Ok(true);
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Direct URL download failed (check if URL is valid and returns 200 OK)"));
             }
         }
 
@@ -612,7 +614,7 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
                 for url in &urls {
                     println!("İndiriliyor: {}", url);
                     let status = Command::new("curl")
-                        .args(["-sSL", "-O", url])
+                        .args(["-sSLf", "-O", url])
                         .current_dir(&tmp_downloads)
                         .status()?;
                     if !status.success() {
