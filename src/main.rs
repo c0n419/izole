@@ -275,8 +275,13 @@ fn extract_tar_zst(pkg_path: &Path, target_dir: &Path) -> io::Result<()> {
 }
 
 fn extract_env_name(source: &str) -> String {
-    if source.starts_with("http://") || source.starts_with("https://") {
-        let mut clean = source.trim_end_matches(".git").to_string();
+    let mut clean_source = source;
+    if clean_source.starts_with("arch:") {
+        clean_source = &clean_source[5..];
+    }
+
+    if clean_source.starts_with("http://") || clean_source.starts_with("https://") {
+        let mut clean = clean_source.trim_end_matches(".git").to_string();
         while clean.ends_with('/') {
             clean.pop();
         }
@@ -285,7 +290,7 @@ fn extract_env_name(source: &str) -> String {
             return name.to_lowercase();
         }
     }
-    let path = Path::new(source);
+    let path = Path::new(clean_source);
     if path.exists() && path.is_file() {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             let mut name = stem.to_lowercase();
@@ -295,7 +300,7 @@ fn extract_env_name(source: &str) -> String {
             return name;
         }
     }
-    source.to_string()
+    clean_source.to_string()
 }
 
 fn handle_arch_package_install(pkg_name: &str, tmp_downloads: &Path) -> io::Result<bool> {
@@ -481,6 +486,29 @@ fn handle_custom_install(_env_name: &str, pkg_source: &str, tmp_downloads: &Path
                 return Ok(true);
             }
         }
+
+        let is_git = pkg_source.ends_with(".git") || pkg_source.contains("github.com/");
+        if is_git {
+            let repo_name = extract_env_name(pkg_source);
+            let env_path = get_env_path(_env_name);
+            let repo_dir = env_path.join("usr/share").join(&repo_name);
+            
+            if repo_dir.exists() {
+                fs::remove_dir_all(&repo_dir)?;
+            }
+            fs::create_dir_all(repo_dir.parent().unwrap())?;
+            
+            println!("[İzole] Sürüm paketi (RPM/DEB) bulunamadı. Git deposu kaynak koddan klonlanıyor: {} -> {}...", pkg_source, repo_dir.display());
+            let status = Command::new("git")
+                .args(["clone", pkg_source, repo_dir.to_str().unwrap()])
+                .status()?;
+                
+            if status.success() {
+                return Ok(true);
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "git clone failed"));
+            }
+        }
     }
     
     let path = Path::new(pkg_source);
@@ -649,6 +677,139 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
     let file = File::create(metadata_path)?;
     serde_json::to_writer_pretty(file, &metadata)?;
 
+    // Git depoları için otomatik derleme/yapılandırma kontrolü
+    let share_dir = env_path.join("usr/share");
+    if share_dir.exists() && share_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&share_dir) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+                    if path.is_dir() && path.join(".git").exists() {
+                        let repo_name = path.file_name().unwrap().to_string_lossy().into_owned();
+                        println!("\n[İzole] '{}' deposu için otomatik derleme/yapılandırma başlatılıyor...", repo_name);
+
+                        let script_path = if path.join("scripts/install.sh").exists() {
+                            Some((path.join("scripts/install.sh"), "scripts/install.sh"))
+                        } else if path.join("install.sh").exists() {
+                            Some((path.join("install.sh"), "install.sh"))
+                        } else if path.join("setup.sh").exists() {
+                            Some((path.join("setup.sh"), "setup.sh"))
+                        } else {
+                            None
+                        };
+
+                        let mut script_executed = false;
+                        if let Some((sp, rel_path)) = script_path {
+                            let mut extra_flags = String::new();
+                            if let Ok(content) = fs::read_to_string(&sp) {
+                                if content.contains("--skip-setup") {
+                                    extra_flags.push_str(" --skip-setup");
+                                }
+                                if content.contains("--non-interactive") {
+                                    extra_flags.push_str(" --non-interactive");
+                                }
+                            }
+                            println!("[İzole] '{}' bulundu, izole ortamda çalıştırılıyor...", rel_path);
+                            let status = run_env_noninteractive(env_name, "bash", &[
+                                "-c".to_string(),
+                                format!("cd /usr/share/{} && bash {}{}", repo_name, rel_path, extra_flags)
+                            ]);
+                            if let Ok(code) = status {
+                                if code == 0 {
+                                    script_executed = true;
+                                }
+                            }
+                        }
+
+                        if !script_executed {
+                            if path.join("Cargo.toml").exists() {
+                                println!("[İzole] 'Cargo.toml' (Rust) bulundu, izole ortamda derleniyor...");
+                                let status = run_env_noninteractive(env_name, "bash", &[
+                                    "-c".to_string(),
+                                    format!("cd /usr/share/{} && cargo build --release", repo_name)
+                                ]);
+                                if let Ok(0) = status {
+                                    let bin_src = path.join("target/release").join(&repo_name);
+                                    if bin_src.exists() {
+                                        let bin_dest = env_path.join("usr/bin").join(&repo_name);
+                                        let _ = fs::create_dir_all(bin_dest.parent().unwrap());
+                                        if let Ok(_) = fs::copy(&bin_src, &bin_dest) {
+                                            #[cfg(unix)]
+                                            {
+                                                use std::os::unix::fs::PermissionsExt;
+                                                let _ = fs::set_permissions(&bin_dest, fs::Permissions::from_mode(0o755));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if path.join("package.json").exists() {
+                                println!("[İzole] 'package.json' (Node.js) bulundu, bağımlılıklar kuruluyor...");
+                                let _ = run_env_noninteractive(env_name, "bash", &[
+                                    "-c".to_string(),
+                                    format!("cd /usr/share/{} && npm install", repo_name)
+                                ]);
+                            }
+
+                            let has_python = path.join("requirements.txt").exists() || path.join("pyproject.toml").exists() || path.join("setup.py").exists();
+                            if has_python {
+                                println!("[İzole] Python projesi tespit edildi, sanal ortam (venv) hazırlanıyor...");
+                                let venv_dir = env_path.join("usr/share/venv");
+                                let _ = fs::create_dir_all(&venv_dir);
+
+                                let _ = run_env_noninteractive(env_name, "python3", &[
+                                    "-m".to_string(),
+                                    "venv".to_string(),
+                                    "/usr/share/venv".to_string()
+                                ]);
+
+                                if path.join("requirements.txt").exists() {
+                                    println!("[İzole] pip bağımlılıkları yükleniyor...");
+                                    let _ = run_env_noninteractive(env_name, "/usr/share/venv/bin/pip", &[
+                                        "install".to_string(),
+                                        "-r".to_string(),
+                                        format!("/usr/share/{}/requirements.txt", repo_name)
+                                    ]);
+                                }
+
+                                if path.join("setup.py").exists() || path.join("pyproject.toml").exists() {
+                                    println!("[İzole] Proje kuruluyor (pip install -e)...");
+                                    let _ = run_env_noninteractive(env_name, "/usr/share/venv/bin/pip", &[
+                                        "install".to_string(),
+                                        "-e".to_string(),
+                                        format!("/usr/share/{}", repo_name)
+                                    ]);
+                                }
+
+                                let possible_entrypoints = ["run_agent.py", "main.py", "run.py", "cli.py"];
+                                for ep in possible_entrypoints {
+                                    if path.join(ep).exists() {
+                                        let wrapper_path = env_path.join("usr/bin").join(&repo_name);
+                                        let _ = fs::create_dir_all(wrapper_path.parent().unwrap());
+                                        let content = format!(
+                                            "#!/bin/bash\nexec /usr/share/venv/bin/python /usr/share/{}/{} \"$@\"\n",
+                                            repo_name, ep
+                                        );
+                                        if let Ok(mut f) = File::create(&wrapper_path) {
+                                            let _ = f.write_all(content.as_bytes());
+                                            #[cfg(unix)]
+                                            {
+                                                use std::os::unix::fs::PermissionsExt;
+                                                let _ = fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Otomatik takma ad (alias) oluşturma kontrolü
     let bin_dir = env_path.join("usr/bin");
     if bin_dir.exists() && bin_dir.is_dir() {
@@ -677,13 +838,55 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
                 let mut target_bin = None;
                 if execs.contains(&env_name.to_string()) {
                     target_bin = Some(env_name.to_string());
-                } else if execs.len() == 1 {
+                } else {
+                    for pkg in packages {
+                        let clean_pkg = extract_env_name(pkg);
+                        if execs.contains(&clean_pkg) {
+                            target_bin = Some(clean_pkg);
+                            break;
+                        }
+                    }
+                }
+                
+                if target_bin.is_none() && execs.len() == 1 {
                     target_bin = Some(execs[0].clone());
                 }
 
                 if let Some(bin_name) = target_bin {
                     println!("\n[İzole] Otomatik terminal takma adı (alias) oluşturuluyor: {}...", env_name);
                     let _ = alias_binary(env_name, &bin_name, Some(env_name));
+                }
+            } else {
+                // usr/bin boş ise, kurulum scriptinin host'ta ~/.local/bin/ dizinine bir launcher yazıp yazmadığını kontrol et
+                let host_bin_dir = dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("/home/ninja"))
+                    .join(".local/bin");
+                if host_bin_dir.exists() && host_bin_dir.is_dir() {
+                    let mut possible_names = vec![
+                        env_name.to_string(),
+                    ];
+                    if !packages.is_empty() {
+                        possible_names.push(extract_env_name(&packages[0]));
+                    }
+                    possible_names.push("hermes".to_string());
+
+                    for name in possible_names {
+                        let host_launcher = host_bin_dir.join(&name);
+                        if host_launcher.exists() && host_launcher.is_file() {
+                            if let Ok(content) = fs::read_to_string(&host_launcher) {
+                                if let Some(exec_line) = content.lines().find(|l| l.trim().starts_with("exec ")) {
+                                    let parts: Vec<&str> = exec_line.split('"').collect();
+                                    if parts.len() >= 2 {
+                                        let target_path = parts[1];
+                                        println!("\n[İzole] Host üzerine kurulan launcher tespit edildi: {} -> {}", name, target_path);
+                                        println!("[İzole] Bu launcher izole ortam içinde çalışacak şekilde otomatik olarak yapılandırılıyor...");
+                                        let _ = alias_binary(env_name, target_path, Some(&name));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -695,6 +898,14 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
 }
 
 fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
+    run_env_ext(env_name, command, args, true)
+}
+
+fn run_env_noninteractive(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
+    run_env_ext(env_name, command, args, false)
+}
+
+fn run_env_ext(env_name: &str, command: &str, args: &[String], inherit_stdin: bool) -> io::Result<i32> {
     let env_path = get_env_path(env_name);
     if !env_path.exists() {
         eprintln!("Hata: '{}' ortamı mevcut değil.", env_name);
@@ -745,6 +956,32 @@ fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
         bwrap_args.push(env_usr.to_str().unwrap().to_string());
         bwrap_args.push("--ro-overlay".to_string());
         bwrap_args.push("/usr".to_string());
+
+        // Custom Git depolarını ve python sanal ortamını (venv) yazılabilir olarak bağla
+        let share_dir = env_path.join("usr/share");
+        if share_dir.exists() && share_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&share_dir) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_dir() && path.join(".git").exists() {
+                            let repo_name = path.file_name().unwrap().to_string_lossy().into_owned();
+                            let target_path = format!("/usr/share/{}", repo_name);
+                            bwrap_args.push("--bind".to_string());
+                            bwrap_args.push(path.to_str().unwrap().to_string());
+                            bwrap_args.push(target_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        let venv_dir = env_path.join("usr/share/venv");
+        if venv_dir.exists() {
+            bwrap_args.push("--bind".to_string());
+            bwrap_args.push(venv_dir.to_str().unwrap().to_string());
+            bwrap_args.push("/usr/share/venv".to_string());
+        }
 
         // Temel sistem sembolik bağları
         bwrap_args.push("--symlink".to_string());
@@ -797,6 +1034,9 @@ fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
 
         let mut cmd = Command::new("bwrap");
         cmd.args(&bwrap_args);
+        if !inherit_stdin {
+            cmd.stdin(Stdio::null());
+        }
 
         // Alt süreçte sinyal yöneticilerini varsayılana döndür
         unsafe {
@@ -881,11 +1121,16 @@ fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
                 if retry_count < max_retries {
                     if diag.fix_action == "install_container_package" && diag.package_name.is_some() {
                         let pkg = diag.package_name.unwrap();
-                        let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                            .with_prompt(format!("Yapay zeka, izole ortam içine '{}' paketini kurarak çözmeyi öneriyor. Kurulsun mu?", pkg))
-                            .default(true)
-                            .interact()
-                            .unwrap_or(false);
+                        let confirm = if inherit_stdin {
+                            Confirm::with_theme(&ColorfulTheme::default())
+                                .with_prompt(format!("Yapay zeka, izole ortam içine '{}' paketini kurarak çözmeyi öneriyor. Kurulsun mu?", pkg))
+                                .default(true)
+                                .interact()
+                                .unwrap_or(false)
+                        } else {
+                            println!("[İzole AI-Fix] Yapay zeka, izole ortam içine '{}' paketinin kurulmasını öneriyor. (İnteraktif olmayan mod, otomatik onay verilmedi)", pkg);
+                            false
+                        };
 
                         if confirm {
                             println!("\x1b[1;34m[İzole AI-Fix] Paket kuruluyor: {}...\x1b[0m", pkg);
@@ -897,11 +1142,16 @@ fn run_env(env_name: &str, command: &str, args: &[String]) -> io::Result<i32> {
                         }
                     } else if diag.fix_action == "run_command" && diag.command_to_run.is_some() {
                         let cmd_str = diag.command_to_run.unwrap();
-                        let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                            .with_prompt(format!("Yapay zeka, şu komutu çalıştırmayı öneriyor:\n  -> {}\nKomut çalıştırılsın mı?", cmd_str))
-                            .default(false)
-                            .interact()
-                            .unwrap_or(false);
+                        let confirm = if inherit_stdin {
+                            Confirm::with_theme(&ColorfulTheme::default())
+                                .with_prompt(format!("Yapay zeka, şu komutu çalıştırmayı öneriyor:\n  -> {}\nKomut çalıştırılsın mı?", cmd_str))
+                                .default(false)
+                                .interact()
+                                .unwrap_or(false)
+                        } else {
+                            println!("[İzole AI-Fix] Yapay zeka, şu komutun çalıştırılmasını öneriyor:\n  -> {}\n(İnteraktif olmayan mod, otomatik onay verilmedi)", cmd_str);
+                            false
+                        };
 
                         if confirm {
                             println!("\x1b[1;34m[İzole AI-Fix] Komut çalıştırılıyor...\x1b[0m");
