@@ -859,35 +859,118 @@ fn install_packages(env_name: &str, packages: &[String]) -> io::Result<()> {
                     let _ = alias_binary(env_name, &bin_name, Some(env_name));
                 }
             } else {
-                // usr/bin boş ise, kurulum scriptinin host'ta ~/.local/bin/ dizinine bir launcher yazıp yazmadığını kontrol et
+                // usr/bin boş ise, iki yöntem deniyoruz:
+                
+                // Yöntem 1: Kurulum scriptinin host'ta ~/.local/bin/ dizinine yeni bir launcher yazıp yazmadığını kontrol et
+                let mut found_host_launcher = false;
                 let host_bin_dir = dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("/home/ninja"))
                     .join(".local/bin");
                 if host_bin_dir.exists() && host_bin_dir.is_dir() {
-                    let mut possible_names = vec![
-                        env_name.to_string(),
-                    ];
-                    if !packages.is_empty() {
-                        possible_names.push(extract_env_name(&packages[0]));
-                    }
-                    possible_names.push("hermes".to_string());
-
-                    for name in possible_names {
-                        let host_launcher = host_bin_dir.join(&name);
-                        if host_launcher.exists() && host_launcher.is_file() {
-                            if let Ok(content) = fs::read_to_string(&host_launcher) {
-                                if let Some(exec_line) = content.lines().find(|l| l.trim().starts_with("exec ")) {
-                                    let parts: Vec<&str> = exec_line.split('"').collect();
-                                    if parts.len() >= 2 {
-                                        let target_path = parts[1];
-                                        println!("\n[İzole] Host üzerine kurulan launcher tespit edildi: {} -> {}", name, target_path);
-                                        println!("[İzole] Bu launcher izole ortam içinde çalışacak şekilde otomatik olarak yapılandırılıyor...");
-                                        let _ = alias_binary(env_name, target_path, Some(&name));
-                                        break;
+                    if let Ok(entries) = fs::read_dir(&host_bin_dir) {
+                        for entry in entries {
+                            if let Ok(entry) = entry {
+                                let path = entry.path();
+                                if path.is_file() {
+                                    if let Ok(meta) = path.metadata() {
+                                        if let Ok(modified) = meta.modified() {
+                                            if let Ok(elapsed) = modified.elapsed() {
+                                                // Son 2 dakika içinde oluşturulmuş/düzenlenmiş dosyaları kontrol et
+                                                if elapsed.as_secs() < 120 {
+                                                    if let Ok(content) = fs::read_to_string(&path) {
+                                                        // Zaten bir izole wrapper'ı olmamalı
+                                                        if !content.contains("izole run") {
+                                                            if let Some(exec_line) = content.lines().find(|l| l.trim().starts_with("exec ")) {
+                                                                let parts: Vec<&str> = exec_line.split('"').collect();
+                                                                if parts.len() >= 2 {
+                                                                    let target_path = parts[1];
+                                                                    if target_path != "$@" && target_path != "$*" {
+                                                                        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                                                                        println!("\n[İzole] Host üzerine kurulan launcher tespit edildi: {} -> {}", name, target_path);
+                                                                        println!("[İzole] Bu launcher izole ortam içinde çalışacak şekilde otomatik olarak yapılandırılıyor...");
+                                                                        let _ = alias_binary(env_name, target_path, Some(&name));
+                                                                        found_host_launcher = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                // Yöntem 2: Eğer host launcher bulunamadıysa, opt/ dizini altında kurulu bir binary olup olmadığını tara
+                if !found_host_launcher {
+                    let opt_dir = env_path.join("opt");
+                    let mut found_opt_bin = None;
+                    if opt_dir.exists() && opt_dir.is_dir() {
+                        // Opt dizinini derinlemesine tara
+                        fn scan_executables(dir: &Path) -> Vec<PathBuf> {
+                            let mut res = Vec::new();
+                            if let Ok(entries) = fs::read_dir(dir) {
+                                for entry in entries {
+                                    if let Ok(entry) = entry {
+                                        let path = entry.path();
+                                        if path.is_dir() {
+                                            res.extend(scan_executables(&path));
+                                        } else if path.is_file() {
+                                            #[cfg(unix)]
+                                            {
+                                                use std::os::unix::fs::MetadataExt;
+                                                if let Ok(meta) = path.metadata() {
+                                                    if meta.mode() & 0o111 != 0 {
+                                                        if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                                                            if filename == "chrome-sandbox" || filename == "chrome_crashpad_handler" {
+                                                                continue;
+                                                            }
+                                                            if filename.contains(".so") || filename.starts_with("lib") {
+                                                                continue;
+                                                            }
+                                                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                                                                if ext == "so" || ext == "dat" || ext == "bin" || ext == "pak" || ext == "json" {
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            res.push(path.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            res
+                        }
+                        
+                        let opt_execs = scan_executables(&opt_dir);
+                        if !opt_execs.is_empty() {
+                            let mut best_match = &opt_execs[0];
+                            for exec in &opt_execs {
+                                if exec.file_name().unwrap().to_string_lossy().to_lowercase().contains(&env_name.to_lowercase()) {
+                                    best_match = exec;
+                                    break;
+                                }
+                            }
+                            
+                            let rel_path = best_match.strip_prefix(&env_path).unwrap();
+                            let target_path = format!("/{}", rel_path.to_string_lossy());
+                            let bin_name = best_match.file_name().unwrap().to_string_lossy().into_owned();
+                            found_opt_bin = Some((target_path, bin_name));
+                        }
+                    }
+
+                    if let Some((target_path, _)) = found_opt_bin {
+                        println!("\n[İzole] opt/ dizini altında kurulu binary tespit edildi: {}", target_path);
+                        println!("[İzole] Otomatik terminal takma adı (alias) oluşturuluyor: {}...", env_name);
+                        let _ = alias_binary(env_name, &target_path, Some(env_name));
                     }
                 }
             }
@@ -1215,9 +1298,17 @@ fn process_desktop_file(env_name: &str, file_path: &Path) -> io::Result<()> {
             if !parts.is_empty() {
                 let exec_path = Path::new(parts[0]);
                 let binary_name = exec_path.file_name().unwrap().to_string_lossy();
+                let env_bin_path = get_env_path(env_name).join("usr/bin").join(&*binary_name);
+                
+                let target_command = if env_bin_path.exists() {
+                    binary_name.into_owned()
+                } else {
+                    parts[0].to_string()
+                };
+                
                 let remaining = parts[1..].join(" ");
                 // Kısayolun 'izole' aracılığıyla çalışmasını sağla
-                let new_exec = format!("Exec=izole run {} {} {}", env_name, binary_name, remaining);
+                let new_exec = format!("Exec=izole run {} {} {}", env_name, target_command, remaining);
                 *line = new_exec;
                 has_exec = true;
             }
@@ -1577,9 +1668,13 @@ fn alias_binary(env_name: &str, binary_name: &str, alias_name: Option<&str>) -> 
         std::process::exit(1);
     }
 
-    let binary_in_env = env_path.join("usr/bin").join(binary_name);
-    if !binary_in_env.exists() {
-        println!("Uyarı: Ortamın usr/bin dizininde '{}' dosyası bulunamadı. Yine de takma ad oluşturuluyor...", binary_name);
+    let exists = if binary_name.starts_with('/') {
+        env_path.join(binary_name.trim_start_matches('/')).exists() || Path::new(binary_name).exists()
+    } else {
+        env_path.join("usr/bin").join(binary_name).exists()
+    };
+    if !exists {
+        println!("Uyarı: Ortam içinde '{}' dosyası bulunamadı. Yine de takma ad oluşturuluyor...", binary_name);
     }
 
     let target_alias = alias_name.unwrap_or(binary_name);
@@ -1593,7 +1688,7 @@ fn alias_binary(env_name: &str, binary_name: &str, alias_name: Option<&str>) -> 
         .unwrap_or_else(|_| PathBuf::from("/home/ninja/.local/bin/izole"));
 
     let content = format!(
-        "#!/bin/bash\nexec {} run {} {} \"$@\"\n",
+        "#!/bin/bash\nexec {} run {} {} -- \"$@\"\n",
         izole_exe.to_string_lossy(),
         env_name,
         binary_name
